@@ -10,27 +10,37 @@ import (
 )
 
 // LogicalDecodingMessage is a pgoutput logical decoding message (type 'M'),
-// produced by pg_logical_emit_message. Wire layout, from logicalmsg_read:
+// produced by pg_logical_emit_message. Wire layout, from
+// logicalrep_write_message in src/backend/replication/logical/proto.c:
 //
 //	Byte1('M')   message type
+//	Int32        XID, only inside a streamed transaction (proto version 2)
 //	Int8         flags (bit 0 = transactional)
-//	Int64        LSN, only when the message is transactional
+//	Int64        LSN of the message, always present
 //	String       prefix, null terminated
 //	Int32        content length
 //	Bytes        content
 //
 // There is no commit timestamp on the wire. MessageTime is the server time of
-// the WAL record. Inside a streamed transaction (proto version 2) a 4 byte XID
-// precedes the body, matching the other streamed decoders.
+// the WAL record.
 type LogicalDecodingMessage struct {
 	MessageTime time.Time
-	Flags       uint8
-	// LSN is the WAL position pgoutput reports for a transactional message.
-	// Zero for a non-transactional message, which has no LSN on the wire.
-	LSN     pq.LSN
-	Prefix  string
-	Content []byte
-	XID     uint32
+	Prefix      string
+	Content     []byte
+	// LSN is the position of the message's own WAL record, for transactional
+	// and non-transactional messages alike.
+	LSN   pq.LSN
+	XID   uint32
+	Flags uint8
+}
+
+// Transactional reports whether the message was emitted with
+// pg_logical_emit_message(true, ...): it is then part of its transaction,
+// arrives between BEGIN and COMMIT, and is dropped with it on rollback. A
+// non-transactional message is sent as soon as it is decoded, outside any
+// transaction.
+func (m *LogicalDecodingMessage) Transactional() bool {
+	return m.Flags&1 != 0
 }
 
 func NewLogicalDecodingMessage(data []byte, streamedTransaction bool, serverTime time.Time) (*LogicalDecodingMessage, error) {
@@ -45,28 +55,24 @@ func (m *LogicalDecodingMessage) decode(data []byte, streamedTransaction bool) e
 	skipByte := 1
 
 	if streamedTransaction {
-		if len(data) < 13 {
-			return errors.Newf("streamed transaction logical decoding message length must be at least 13 bytes, but got %d", len(data))
+		if len(data) < skipByte+4 {
+			return errors.Newf("streamed transaction logical decoding message is missing its XID, got %d bytes", len(data))
 		}
 
 		m.XID = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 	}
 
-	if len(data) < skipByte+2 {
-		return errors.Newf("logical decoding message length must be at least %d bytes, but got %d", skipByte+2, len(data))
+	// flags, the LSN, and at least the prefix's null terminator
+	if len(data) < skipByte+10 {
+		return errors.Newf("logical decoding message length must be at least %d bytes, but got %d", skipByte+10, len(data))
 	}
 
 	m.Flags = data[skipByte]
 	skipByte++
 
-	if m.Flags&1 != 0 {
-		if len(data) < skipByte+8 {
-			return errors.Newf("transactional logical decoding message is missing its LSN, got %d bytes", len(data))
-		}
-		m.LSN = pq.LSN(binary.BigEndian.Uint64(data[skipByte:]))
-		skipByte += 8
-	}
+	m.LSN = pq.LSN(binary.BigEndian.Uint64(data[skipByte:]))
+	skipByte += 8
 
 	relIdx := bytes.IndexByte(data[skipByte:], 0)
 	if relIdx < 0 {
@@ -88,7 +94,9 @@ func (m *LogicalDecodingMessage) decode(data []byte, streamedTransaction bool) e
 		return errors.Newf("logical decoding message content length out of bounds, content %d, remaining %d", contentLength, len(data)-skipByte)
 	}
 
-	m.Content = data[skipByte : skipByte+contentLength]
+	// A copy: data aliases the connection's read buffer, which the next
+	// receive overwrites while the listener may still hold the message.
+	m.Content = bytes.Clone(data[skipByte : skipByte+contentLength])
 
 	return nil
 }

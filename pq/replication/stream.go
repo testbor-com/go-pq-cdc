@@ -42,11 +42,13 @@ type ListenerContext struct {
 	Ack     func() error
 	// Xid is the top-level transaction that produced Message (Begin.Xid, or
 	// StreamStart.Xid for a streamed transaction). Zero when the message is
-	// not part of a transaction, including snapshot events.
+	// not part of a transaction: snapshot events and non-transactional
+	// logical decoding messages.
 	Xid uint32
 	// CommitLSN is the start of the commit record of the transaction that
 	// produced Message (pgoutput Begin.FinalLSN, StreamCommit.CommitLSN for
-	// streamed transactions). Zero for snapshot events.
+	// streamed transactions). Zero for snapshot events and non-transactional
+	// logical decoding messages.
 	//
 	// A standby has applied that transaction only once
 	// pg_last_wal_replay_lsn() > CommitLSN. The comparison is strict:
@@ -577,12 +579,6 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 		m.LSN = xld.WALStart
 	case *format.Delete:
 		m.LSN = xld.WALStart
-	case *format.LogicalDecodingMessage:
-		// A non-transactional message has no LSN on the wire. Use the WAL
-		// record position so the consumer still has a location for it.
-		if m.LSN == 0 {
-			m.LSN = xld.WALStart
-		}
 	}
 
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
@@ -628,21 +624,46 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		// (ROLLBACK TO SAVEPOINT, plpgsql EXCEPTION block) rolled back.
 		streamBuf.abortTx(msg.Xid, msg.SubXid)
 
+	case *format.LogicalDecodingMessage:
+		if msg.Transactional() {
+			bufferChange(decodedMsg, xld, buf, streamBuf)
+			return
+		}
+		// pg_logical_emit_message(false, ...) is sent the moment it is decoded,
+		// never between BEGIN and COMMIT. It belongs to no transaction, so it
+		// skips the commit look-ahead, where the next BEGIN would discard it,
+		// and is acknowledged at its own LSN.
+		buf.send(&Message{message: decodedMsg, walStart: int64(msg.LSN)})
+
 	default:
 		// DML event (Insert, Update, Delete, Relation, …)
-		m := &Message{
-			message:  decodedMsg,
-			walStart: int64(xld.WALStart),
-		}
-		if streamBuf.streaming {
-			m.xid = streamBuf.activeXid
-			streamBuf.append(m, messageXid(decodedMsg))
-		} else {
-			m.xid = buf.xid
-			m.commitLSN = buf.commitLSN
-			buf.buffer(m)
-		}
+		bufferChange(decodedMsg, xld, buf, streamBuf)
 	}
+}
+
+// bufferChange queues a change of the current transaction: per XID while a
+// streamed transaction is open, otherwise in the commit look-ahead.
+func bufferChange(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
+	m := &Message{
+		message:  decodedMsg,
+		walStart: int64(xld.WALStart),
+	}
+	if streamBuf.streaming {
+		m.xid = streamBuf.activeXid
+		streamBuf.append(m, messageXid(decodedMsg))
+	} else {
+		m.xid = buf.xid
+		m.commitLSN = buf.commitLSN
+		buf.buffer(m)
+	}
+}
+
+// outsideTransaction reports a message that belongs to no transaction, a
+// non-transactional logical decoding message: the visibility guard has nothing
+// to certify for it.
+func outsideTransaction(msg any) bool {
+	m, ok := msg.(*format.LogicalDecodingMessage)
+	return ok && !m.Transactional()
 }
 
 // messageXid returns the (sub)transaction XID a streamed message was decoded
@@ -737,7 +758,7 @@ func (s *stream) processLoop(ctx context.Context) error {
 			}
 
 			// Gate once per transaction, on its first message.
-			if s.guard != nil && (!lastGated.gated || msg.xid != lastGated.xid || msg.commitLSN != lastGated.commitLSN) {
+			if s.guard != nil && !outsideTransaction(msg.message) && (!lastGated.gated || msg.xid != lastGated.xid || msg.commitLSN != lastGated.commitLSN) {
 				if err := s.gate(ctx, msg.xid, msg.commitLSN); err != nil {
 					if ctx.Err() != nil {
 						// Shutting down mid-wait: never dispatch an uncertified message.
